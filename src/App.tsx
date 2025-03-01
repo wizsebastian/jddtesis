@@ -8,7 +8,8 @@ const users = [
   { username: "user2", password: "123", role: "CONTRACTOR" },
 ];
 
-let channel = new BroadcastChannel("securechain_channel");
+// Crear un canal global fuera del componente
+let globalChannel = null;
 
 const App = () => {
   const [currentUser, setCurrentUser] = useState(
@@ -20,18 +21,32 @@ const App = () => {
   const [blocks, setBlocks] = useState(
     () => JSON.parse(localStorage.getItem("blocks")) || []
   );
-
   const [logs, setLogs] = useState(
     () => JSON.parse(localStorage.getItem("logs")) || []
   );
+  const [showKeyModal, setShowKeyModal] = useState(false);
+  const [currentBlockchainFile, setCurrentBlockchainFile] = useState(null);
+  const [showVerifyModal, setShowVerifyModal] = useState(false);
+  const [currentBlock, setCurrentBlock] = useState(null);
+  const [verifyKeys, setVerifyKeys] = useState({
+    SUPERVISOR: "",
+    ESTADO: "",
+    CONTRACTOR: "",
+  });
   const [loginUsername, setLoginUsername] = useState("");
   const [loginPassword, setLoginPassword] = useState("");
   const [selectedFileName, setSelectedFileName] = useState("");
   const [selectedFilePath, setSelectedFilePath] = useState("");
   const fileInputRef = useRef(null);
 
+  // Inicializar el canal de comunicación
   useEffect(() => {
-    channel.onmessage = (message) => {
+    // Si no existe el canal global, crear uno nuevo
+    if (!globalChannel) {
+      globalChannel = new BroadcastChannel("securechain_channel");
+    }
+
+    const handleMessage = (message) => {
       if (
         ["UPDATE_FILES", "UPDATE_BLOCKS", "UPDATE_LOGS"].includes(
           message.data.type
@@ -43,17 +58,38 @@ const App = () => {
         toast.info(message.data.message);
       }
     };
+
+    globalChannel.onmessage = handleMessage;
+
+    // No cerramos el canal al desmontar para evitar problemas
+    return () => {
+      globalChannel.onmessage = null;
+    };
   }, []);
 
   const loadData = () => {
-    setFiles(JSON.parse(localStorage.getItem("files")) || []);
-    setBlocks(JSON.parse(localStorage.getItem("blocks")) || []);
-    setLogs(JSON.parse(localStorage.getItem("logs")) || []);
+    try {
+      const storedFiles = JSON.parse(localStorage.getItem("files")) || [];
+      const storedBlocks = JSON.parse(localStorage.getItem("blocks")) || [];
+      const storedLogs = JSON.parse(localStorage.getItem("logs")) || [];
+
+      setFiles(storedFiles);
+      setBlocks(storedBlocks);
+      setLogs(storedLogs);
+    } catch (error) {
+      console.error("Error al cargar datos:", error);
+    }
   };
 
   const saveData = (key, value, type) => {
-    localStorage.setItem(key, JSON.stringify(value));
-    channel.postMessage({ type });
+    try {
+      localStorage.setItem(key, JSON.stringify(value));
+      if (globalChannel) {
+        globalChannel.postMessage({ type });
+      }
+    } catch (error) {
+      console.error(`Error al guardar ${key}:`, error);
+    }
   };
 
   const handleLogin = () => {
@@ -80,7 +116,16 @@ const App = () => {
     const newLogs = [...logs, newLog];
     setLogs(newLogs);
     saveData("logs", newLogs, "UPDATE_LOGS");
-    channel.postMessage({ type: "NEW_NOTIFICATION", message: newLog });
+    try {
+      if (globalChannel) {
+        globalChannel.postMessage({
+          type: "NEW_NOTIFICATION",
+          message: newLog,
+        });
+      }
+    } catch (error) {
+      console.error("Error al enviar notificación:", error);
+    }
     toast.info(message);
   };
 
@@ -103,8 +148,15 @@ const App = () => {
         rejections: [],
         addedToBlockchain: false,
         createdBy: currentUser.username,
+        createdAt: new Date().getTime(),
+        keys: {
+          SUPERVISOR: Math.random().toString(36).substring(2, 10),
+          ESTADO: Math.random().toString(36).substring(2, 10),
+          CONTRACTOR: Math.random().toString(36).substring(2, 10),
+        },
       };
-      const updatedFiles = [...files, newFile];
+      // Añadir el nuevo archivo al inicio de la lista
+      const updatedFiles = [newFile, ...files];
       setFiles(updatedFiles);
       saveData("files", updatedFiles, "UPDATE_FILES");
 
@@ -124,9 +176,16 @@ const App = () => {
   const approveFile = (index) => {
     if (!files[index]) return;
 
-    const updatedFiles = [...files];
+    // Crea una copia profunda para evitar problemas de referencia
+    const updatedFiles = JSON.parse(JSON.stringify(files));
+
     if (!updatedFiles[index].approvals.includes(currentUser.role)) {
       updatedFiles[index].approvals.push(currentUser.role);
+
+      // Actualizar estado inmediatamente
+      setFiles(updatedFiles);
+      saveData("files", updatedFiles, "UPDATE_FILES");
+
       addLog(
         `✅ ${currentUser.username} aprobó el archivo "${updatedFiles[index].name}".`
       );
@@ -136,8 +195,6 @@ const App = () => {
           `🔒 Archivo "${updatedFiles[index].name}" ha sido aprobado por 3 usuarios y está listo para ser agregado al blockchain.`
         );
       }
-      setFiles(updatedFiles);
-      saveData("files", updatedFiles, "UPDATE_FILES");
     } else {
       toast.warning("⚠️ Ya has aprobado este archivo.");
     }
@@ -146,14 +203,21 @@ const App = () => {
   const rejectFile = (index) => {
     if (!files[index]) return;
 
-    const updatedFiles = [...files];
-    updatedFiles[index].rejections.push(currentUser.role);
-    addLog(
-      `❌ ${currentUser.username} rechazó el archivo "${updatedFiles[index].name}".`
-    );
+    // Copia profunda
+    const updatedFiles = JSON.parse(JSON.stringify(files));
 
-    setFiles(updatedFiles);
-    saveData("files", updatedFiles, "UPDATE_FILES");
+    if (!updatedFiles[index].rejections.includes(currentUser.role)) {
+      updatedFiles[index].rejections.push(currentUser.role);
+
+      setFiles(updatedFiles);
+      saveData("files", updatedFiles, "UPDATE_FILES");
+
+      addLog(
+        `❌ ${currentUser.username} rechazó el archivo "${updatedFiles[index].name}".`
+      );
+    } else {
+      toast.warning("⚠️ Ya has rechazado este archivo.");
+    }
   };
 
   const addToBlockchain = (index) => {
@@ -177,12 +241,22 @@ const App = () => {
       return;
     }
 
+    // Mostrar modal con claves
+    setCurrentBlockchainFile({ ...file }); // Crear copia para evitar mutaciones
+    setShowKeyModal(true);
+  };
+
+  const confirmAddToBlockchain = () => {
+    if (!currentBlockchainFile) return;
+
     // Crear nuevo bloque con este archivo
     const newBlock = {
       hash: Math.random().toString(36).substring(2, 15),
       previousHash: blocks.length > 0 ? blocks[blocks.length - 1].hash : "0",
-      files: [file.name],
+      files: [currentBlockchainFile.name],
+      path: currentBlockchainFile.path,
       timestamp: new Date().toLocaleString(),
+      keys: currentBlockchainFile.keys,
     };
 
     const updatedBlocks = [...blocks, newBlock];
@@ -190,47 +264,87 @@ const App = () => {
     saveData("blocks", updatedBlocks, "UPDATE_BLOCKS");
 
     addLog(
-      `📦 ${currentUser.username} ha agregado el archivo "${file.name}" a la blockchain.`
+      `📦 ${currentUser.username} ha agregado el archivo "${currentBlockchainFile.name}" a la blockchain.`
     );
 
     // Eliminar el archivo de la lista de pendientes
-    const updatedFiles = files.filter((_, i) => i !== index);
-    setFiles(updatedFiles);
-    saveData("files", updatedFiles, "UPDATE_FILES");
+    const fileIndex = files.findIndex(
+      (f) => f.hash === currentBlockchainFile.hash
+    );
+    if (fileIndex !== -1) {
+      const updatedFiles = [...files];
+      updatedFiles.splice(fileIndex, 1);
+      setFiles(updatedFiles);
+      saveData("files", updatedFiles, "UPDATE_FILES");
+    }
+
+    // Cerrar modal
+    setShowKeyModal(false);
+    setCurrentBlockchainFile(null);
   };
 
-  const createBlock = () => {
-    const approvedFiles = files.filter(
-      (file) =>
-        file.approvals.length === 3 && file.createdBy === currentUser.username
-    );
-    if (approvedFiles.length === 0) return;
+  const openVerifyModal = (block) => {
+    if (!block) return;
 
-    const newBlock = {
-      hash: Math.random().toString(36).substring(2, 15),
-      previousHash: blocks.length > 0 ? blocks[blocks.length - 1].hash : "0",
-      files: approvedFiles.map((file) => file.name),
-      timestamp: new Date().toLocaleString(),
-    };
+    setCurrentBlock({ ...block }); // Crear copia para evitar mutaciones
+    setVerifyKeys({
+      SUPERVISOR: "",
+      ESTADO: "",
+      CONTRACTOR: "",
+    });
+    setShowVerifyModal(true);
+  };
 
-    const updatedBlocks = [...blocks, newBlock];
-    setBlocks(updatedBlocks);
-    saveData("blocks", updatedBlocks, "UPDATE_BLOCKS");
+  const verifyBlockAccess = () => {
+    if (!currentBlock) return;
 
-    addLog(
-      `📦 Se creó un bloque en la blockchain con ${approvedFiles.length} archivos aprobados.`
-    );
+    // Verificar si el bloque tiene claves
+    if (!currentBlock.keys) {
+      toast.error("❌ Este bloque no tiene claves de acceso configuradas.");
+      setShowVerifyModal(false);
+      setCurrentBlock(null);
+      return;
+    }
 
-    const remainingFiles = files.filter(
-      (file) =>
-        file.approvals.length < 3 || file.createdBy !== currentUser.username
-    );
-    setFiles(remainingFiles);
-    saveData("files", remainingFiles, "UPDATE_FILES");
+    // Verificar claves
+    const isValid =
+      verifyKeys.SUPERVISOR === currentBlock.keys.SUPERVISOR &&
+      verifyKeys.ESTADO === currentBlock.keys.ESTADO &&
+      verifyKeys.CONTRACTOR === currentBlock.keys.CONTRACTOR;
+
+    if (isValid) {
+      toast.success(
+        "✅ Verificación exitosa. Ahora puedes acceder al archivo."
+      );
+      addLog(
+        `🔓 ${currentUser.username} ha verificado acceso al archivo en el bloque ${currentBlock.hash}.`
+      );
+      // Aquí podrías abrir el archivo o redirigir a la ruta
+      if (currentBlock.path) {
+        window.open(currentBlock.path, "_blank");
+      } else {
+        toast.warning("⚠️ Este bloque no tiene una ruta de archivo definida.");
+      }
+    } else {
+      toast.error(
+        "❌ Las claves ingresadas no son correctas. Acceso denegado."
+      );
+      addLog(
+        `🚫 ${currentUser.username} ha intentado acceder a un archivo pero la verificación falló.`
+      );
+    }
+
+    setShowVerifyModal(false);
+    setCurrentBlock(null);
   };
 
   // Mostrar todos los archivos pendientes a todos los usuarios
-  const filteredFiles = files;
+  const filteredFiles = files || [];
+
+  // Validar que currentBlockchainFile y currentBlock tengan claves antes de mostrar modalas
+  const safeShowKeyModal =
+    showKeyModal && currentBlockchainFile && currentBlockchainFile.keys;
+  const safeShowVerifyModal = showVerifyModal && currentBlock;
 
   return (
     <div className="p-6 text-white bg-gray-900 min-h-screen">
@@ -293,7 +407,10 @@ const App = () => {
           <h2 className="text-2xl font-bold mt-6">📁 Archivos Pendientes</h2>
           {filteredFiles.length > 0 ? (
             filteredFiles.map((file, index) => (
-              <div key={index} className="bg-gray-800 p-4 rounded mt-2">
+              <div
+                key={file.hash || index}
+                className="bg-gray-800 p-4 rounded mt-2"
+              >
                 <div className="flex justify-between items-center">
                   <div>
                     📄 {file.name} | 🔢 Aprobaciones: {file.approvals.length}/3
@@ -302,25 +419,36 @@ const App = () => {
                         Tu archivo
                       </span>
                     )}
+                    {file.approvals.length >= 3 && (
+                      <span className="ml-2 bg-blue-700 text-xs p-1 rounded">
+                        Aprobado ✓
+                      </span>
+                    )}
                   </div>
                   <div>
-                    <button
-                      className="bg-blue-500 p-2 ml-2 rounded"
-                      onClick={() => approveFile(files.indexOf(file))}
-                    >
-                      Aprobar
-                    </button>
-                    <button
-                      className="bg-red-500 p-2 ml-2 rounded"
-                      onClick={() => rejectFile(files.indexOf(file))}
-                    >
-                      Rechazar
-                    </button>
+                    {file.approvals.length < 3 && (
+                      <>
+                        <button
+                          className="bg-blue-500 p-2 ml-2 rounded"
+                          onClick={() => approveFile(index)}
+                          disabled={file.approvals.includes(currentUser.role)}
+                        >
+                          Aprobar
+                        </button>
+                        <button
+                          className="bg-red-500 p-2 ml-2 rounded"
+                          onClick={() => rejectFile(index)}
+                          disabled={file.rejections.includes(currentUser.role)}
+                        >
+                          Rechazar
+                        </button>
+                      </>
+                    )}
                     {file.createdBy === currentUser.username &&
                       file.approvals.length >= 3 && (
                         <button
                           className="bg-green-500 p-2 ml-2 rounded"
-                          onClick={() => addToBlockchain(files.indexOf(file))}
+                          onClick={() => addToBlockchain(index)}
                         >
                           Agregar al Blockchain
                         </button>
@@ -328,8 +456,14 @@ const App = () => {
                   </div>
                 </div>
                 {file.path && (
-                  <div className="mt-2 text-gray-400 text-sm">
-                    Ruta: {file.path}
+                  <div
+                    className={`mt-2 text-sm ${
+                      file.approvals.length >= 3
+                        ? "text-yellow-400 font-medium"
+                        : "text-gray-400"
+                    }`}
+                  >
+                    {file.approvals.length >= 3 ? "🔗 " : ""}Ruta: {file.path}
                   </div>
                 )}
               </div>
@@ -341,9 +475,22 @@ const App = () => {
           <h2 className="text-2xl font-bold mt-6">🔗 Blockchain</h2>
           {Array.isArray(blocks) && blocks.length > 0 ? (
             blocks.map((block, index) => (
-              <div key={index} className="bg-gray-800 p-4 rounded mt-2">
-                🔗 Hash: {block.hash} | ⏮️ Hash Anterior: {block.previousHash} |
-                🕒 {block.timestamp}
+              <div
+                key={block.hash || index}
+                className="bg-gray-800 p-4 rounded mt-2"
+              >
+                <div className="flex justify-between items-center">
+                  <div>
+                    🔗 Hash: {block.hash} | ⏮️ Hash Anterior:{" "}
+                    {block.previousHash} | 🕒 {block.timestamp}
+                  </div>
+                  <button
+                    className="bg-blue-500 p-2 rounded"
+                    onClick={() => openVerifyModal(block)}
+                  >
+                    Ver Archivo
+                  </button>
+                </div>
                 <ul>
                   {Array.isArray(block.files) &&
                     block.files.map((file, i) => <li key={i}>📄 {file}</li>)}
@@ -354,6 +501,132 @@ const App = () => {
             <p>No hay bloques en la blockchain aún.</p>
           )}
         </>
+      )}
+
+      {safeShowKeyModal && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+          <div className="bg-gray-800 p-6 rounded-lg w-full max-w-lg">
+            <h3 className="text-xl font-bold mb-4">
+              Claves de Acceso para el Blockchain
+            </h3>
+            <p className="mb-4">
+              El archivo <strong>{currentBlockchainFile.name}</strong> será
+              agregado al blockchain con las siguientes claves:
+            </p>
+
+            <div className="bg-gray-700 p-4 rounded mb-4">
+              <div className="mb-2">
+                <span className="font-bold">Ruta del archivo:</span>
+                <div className="bg-gray-900 p-2 rounded mt-1">
+                  {currentBlockchainFile.path}
+                </div>
+              </div>
+              <div className="mb-2">
+                <span className="font-bold">Clave SUPERVISOR:</span>
+                <div className="bg-gray-900 p-2 rounded mt-1">
+                  {currentBlockchainFile.keys.SUPERVISOR}
+                </div>
+              </div>
+              <div className="mb-2">
+                <span className="font-bold">Clave ESTADO:</span>
+                <div className="bg-gray-900 p-2 rounded mt-1">
+                  {currentBlockchainFile.keys.ESTADO}
+                </div>
+              </div>
+              <div className="mb-2">
+                <span className="font-bold">Clave CONTRACTOR:</span>
+                <div className="bg-gray-900 p-2 rounded mt-1">
+                  {currentBlockchainFile.keys.CONTRACTOR}
+                </div>
+              </div>
+            </div>
+
+            <p className="text-yellow-400 mb-4">
+              <strong>Importante:</strong> Guarda estas claves. Serán necesarias
+              para acceder al archivo desde el blockchain.
+            </p>
+
+            <div className="flex justify-end">
+              <button
+                className="bg-gray-500 p-2 rounded mr-2"
+                onClick={() => setShowKeyModal(false)}
+              >
+                Cancelar
+              </button>
+              <button
+                className="bg-green-500 p-2 rounded"
+                onClick={confirmAddToBlockchain}
+              >
+                Confirmar y Agregar
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {safeShowVerifyModal && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+          <div className="bg-gray-800 p-6 rounded-lg w-full max-w-lg">
+            <h3 className="text-xl font-bold mb-4">
+              Verificar Acceso al Archivo
+            </h3>
+            <p className="mb-4">
+              Ingresa las 3 claves de acceso para verificar el acceso al
+              archivo:
+            </p>
+
+            <div className="mb-4">
+              <label className="block mb-1">Clave SUPERVISOR:</label>
+              <input
+                type="text"
+                className="w-full p-2 bg-gray-700 rounded"
+                value={verifyKeys.SUPERVISOR}
+                onChange={(e) =>
+                  setVerifyKeys({ ...verifyKeys, SUPERVISOR: e.target.value })
+                }
+              />
+            </div>
+
+            <div className="mb-4">
+              <label className="block mb-1">Clave ESTADO:</label>
+              <input
+                type="text"
+                className="w-full p-2 bg-gray-700 rounded"
+                value={verifyKeys.ESTADO}
+                onChange={(e) =>
+                  setVerifyKeys({ ...verifyKeys, ESTADO: e.target.value })
+                }
+              />
+            </div>
+
+            <div className="mb-4">
+              <label className="block mb-1">Clave CONTRACTOR:</label>
+              <input
+                type="text"
+                className="w-full p-2 bg-gray-700 rounded"
+                value={verifyKeys.CONTRACTOR}
+                onChange={(e) =>
+                  setVerifyKeys({ ...verifyKeys, CONTRACTOR: e.target.value })
+                }
+              />
+            </div>
+
+            <div className="flex justify-end">
+              <button
+                className="bg-gray-500 p-2 rounded mr-2"
+                onClick={() => setShowVerifyModal(false)}
+              >
+                Cancelar
+              </button>
+              <button
+                className="bg-blue-500 p-2 rounded"
+                onClick={verifyBlockAccess}
+              >
+                Verificar
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );
